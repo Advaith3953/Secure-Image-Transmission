@@ -1,3 +1,5 @@
+# Use MSYS2 UCRT64
+
 # One-time setup
 pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-opencv mingw-w64-ucrt-x86_64-pkgconf
 
