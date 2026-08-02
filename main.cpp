@@ -44,6 +44,41 @@ namespace SecureImage {
         }
     };
 
+    
+    struct KeyMaterial {
+        double seed;
+        double r;
+    };
+
+    class KeyDerivation {
+    public:
+        static KeyMaterial fromPassphrase(const string& passphrase) {
+            if (passphrase.empty()) {
+                throw invalid_argument("Passphrase must not be empty.");
+            }
+
+            uint64_t hSeed = fnv1a(passphrase + "|seed");
+            uint64_t hParam = fnv1a(passphrase + "|param");
+
+            double seed = static_cast<double>(hSeed % 1000000ULL) / 1000000.0;
+            if (seed <= 0.0 || seed >= 1.0) seed = 0.314159; // avoid fixed points at 0/1
+
+            double r = 3.6 + static_cast<double>(hParam % 400000ULL) / 1000000.0; // [3.6, 4.0)
+
+            return { seed, r };
+        }
+
+    private:
+        static uint64_t fnv1a(const string& s) {
+            uint64_t hash = 14695981039346656037ULL;
+            for (unsigned char c : s) {
+                hash ^= c;
+                hash *= 1099511628211ULL;
+            }
+            return hash;
+        }
+    };
+
     class ChaoticCipher {
         private:
             double x0;   // seed
@@ -58,6 +93,15 @@ namespace SecureImage {
                     seq[i] = x;
                 }
                 return seq;
+            }
+
+            // Clamp guards against the (very rare) case where a chaos value
+            // rounds up to exactly (i+1), which would index one past the
+            // valid range for the Fisher-Yates swap.
+            static int clampIndex(int j, int hi) {
+                if (j > hi) return hi;
+                if (j < 0) return 0;
+                return j;
             }
 
         public:
@@ -79,7 +123,7 @@ namespace SecureImage {
                 iota(perm.begin(), perm.end(), 0);
 
                 for (int i = total - 1; i > 0; i--) {
-                    int j = static_cast<int>(chaos[i] * (i + 1));
+                    int j = clampIndex(static_cast<int>(chaos[i] * (i + 1)), i);
                     swap(perm[i], perm[j]);
                 }
 
@@ -127,7 +171,7 @@ namespace SecureImage {
                 iota(perm.begin(), perm.end(), 0);
 
                 for (int i = total - 1; i > 0; i--) {
-                    int j = static_cast<int>(chaos[i] * (i + 1));
+                    int j = clampIndex(static_cast<int>(chaos[i] * (i + 1)), i);
                     swap(perm[i], perm[j]);
                 }
 
@@ -157,22 +201,6 @@ namespace SecureImage {
                     ptr[i] = original[i];
             }
         };
-
-    class FileManager {
-    public:
-        static vector<string> listFiles(const string& directory) {
-            vector<string> files;
-            for (const auto& entry : filesystem::directory_iterator(directory)) {
-                if (entry.is_regular_file())
-                    files.push_back(entry.path().string());
-            }
-            return files;
-        }
-
-        static void copyFile(const string& src, const string& dst) {
-            filesystem::copy(src, dst, filesystem::copy_options::overwrite_existing);
-        }
-    };
 }
 
 
@@ -294,9 +322,9 @@ namespace SecureImage {
             return maxFlow;
         }
 
-        void printParentPath() {
-            cout << "Augmenting Path: ";
-            for (int i = 0; i < parent.size(); ++i)
+        void printParentPath() const {
+            cout << "Last augmenting path (BFS parent pointers): ";
+            for (size_t i = 0; i < parent.size(); ++i)
                 if (parent[i] != -1)
                     cout << "(" << parent[i] << " -> " << i << ") ";
             cout << "\n";
@@ -305,6 +333,24 @@ namespace SecureImage {
 
     class GraphLoader {
     public:
+        // Scans the file for the highest node index referenced, without
+        // needing a Graph instance yet — lets the caller size the graph
+        // correctly before actually loading edges into it.
+        static int scanMaxNode(const string& filename) {
+            ifstream file(filename);
+            if (!file) throw runtime_error("Cannot open graph file.");
+
+            string line;
+            int maxNode = -1;
+            while (getline(file, line)) {
+                istringstream iss(line);
+                int u, v, c;
+                if (!(iss >> u >> v >> c)) continue;
+                maxNode = max({maxNode, u, v});
+            }
+            return maxNode;
+        }
+
         static void loadFromFile(Graph& g, const string& filename) {
             ifstream file(filename);
             if (!file) throw runtime_error("Cannot open graph file.");
@@ -324,38 +370,63 @@ namespace SecureImage {
 
 namespace SecureImage {
 
+    // Bundles everything the report needs, instead of threading five
+    // separate out-parameters through simulate().
+    struct TransmissionStats {
+        int maxFlowCapacity = 0;
+        long long totalBytes = 0;
+        int rounds = 0;
+        double cipherTimeMs = 0.0;
+        double simulatedTransferTimeMs = 0.0;
+    };
+
     class TransmissionSimulator {
     private:
         Graph& network;
         int source, sink;
 
+        // Simulated latency per "round" of transmission across the network.
+        // One round moves up to maxFlowCapacity bytes; this is what actually
+        // ties the max-flow value to a transmission time, rather than the
+        // flow computation and the encryption running side by side with no
+        // relationship between them (as in the original version).
+        static constexpr double TICK_MS = 1.0;
+
     public:
         TransmissionSimulator(Graph& g, int s, int t) : network(g), source(s), sink(t) {}
 
-        int simulate(Mat& image, Mat& outputEncrypted, int key, double& timeTaken) {
-            auto start = chrono::high_resolution_clock::now();
+        TransmissionStats simulate(Mat& image, Mat& outputEncrypted, const string& passphrase) {
+            TransmissionStats stats;
 
-            double seed = (key % 1000) / 1000.0;
-            if (seed <= 0.0) seed = 0.5;
-
-            ChaoticCipher cipher(seed, 3.99);
+            auto cipherStart = chrono::high_resolution_clock::now();
+            KeyMaterial key = KeyDerivation::fromPassphrase(passphrase);
+            ChaoticCipher cipher(key.seed, key.r);
             outputEncrypted = image.clone();
             cipher.encrypt(outputEncrypted);
+            auto cipherEnd = chrono::high_resolution_clock::now();
+            stats.cipherTimeMs = chrono::duration<double, milli>(cipherEnd - cipherStart).count();
 
             MaxFlow maxflow(network, source, sink);
-            int maxFlow = maxflow.run();
+            stats.maxFlowCapacity = maxflow.run();
+            if (stats.maxFlowCapacity <= 0) {
+                throw runtime_error("Network has zero max-flow capacity between source and sink; cannot transmit.");
+            }
 
-            auto end = chrono::high_resolution_clock::now();
-            timeTaken = chrono::duration<double, milli>(end - start).count();
+            // Treat the encrypted image as a byte stream and "send" it across
+            // the network in chunks bounded by the channel's max-flow
+            // capacity. More capacity -> fewer rounds -> less simulated time.
+            stats.totalBytes = static_cast<long long>(outputEncrypted.total()) * outputEncrypted.elemSize();
+            stats.rounds = static_cast<int>(
+                (stats.totalBytes + stats.maxFlowCapacity - 1) / stats.maxFlowCapacity  // ceil division
+            );
+            stats.simulatedTransferTimeMs = stats.rounds * TICK_MS;
 
-            return maxFlow;
+            return stats;
         }
 
-        void decryptImage(Mat& encrypted, Mat& outputDecrypted, int key) {
-            double seed = (key % 1000) / 1000.0;
-            if (seed <= 0.0) seed = 0.5;
-
-            ChaoticCipher cipher(seed, 3.99);
+        void decryptImage(Mat& encrypted, Mat& outputDecrypted, const string& passphrase) {
+            KeyMaterial key = KeyDerivation::fromPassphrase(passphrase);
+            ChaoticCipher cipher(key.seed, key.r);
             outputDecrypted = encrypted.clone();
             cipher.decrypt(outputDecrypted);
         }
@@ -399,7 +470,8 @@ namespace SecureImage {
 
     class ReportGenerator {
     public:
-        static void saveReport(const string& filename, double mse, double psnr, int flow, double timeMs) {
+        static void saveReport(const string& filename, double mse, double psnr,
+                                const TransmissionStats& stats) {
             ofstream file(filename);
             if (!file) {
                 cerr << "Unable to write report file!" << endl;
@@ -409,9 +481,14 @@ namespace SecureImage {
             time_t now = time(nullptr);
             file << "Secure Image Transmission Report\n";
             file << "Generated on: " << ctime(&now);
-            file << "\n--- Metrics ---\n";
-            file << "Max Flow   : " << flow << "\n";
-            file << "Time (ms)  : " << timeMs << "\n";
+            file << "\n--- Network / Transmission ---\n";
+            file << "Max Flow Capacity : " << stats.maxFlowCapacity << "\n";
+            file << "Encrypted Size    : " << stats.totalBytes << " bytes\n";
+            file << "Rounds to Send    : " << stats.rounds << "\n";
+            file << "Simulated Xfer Time: " << stats.simulatedTransferTimeMs << " ms\n";
+            file << "\n--- Cipher ---\n";
+            file << "Cipher Time (ms)  : " << stats.cipherTimeMs << "\n";
+            file << "\n--- Fidelity ---\n";
             file << "MSE        : " << mse << "\n";
             file << "PSNR (dB)  : " << psnr << "\n";
             file << "\nReport saved successfully.\n";
@@ -422,7 +499,7 @@ namespace SecureImage {
         string inputImage;
         int nodeCount = 6;
         int source = 0, sink = 5;
-        uchar key = 0xB4;
+        string passphrase;
         int choice;
 
         cout << "\n====== Secure Image Transmission App ======\n";
@@ -446,16 +523,34 @@ namespace SecureImage {
         } else if (choice == 2) {
             cout << "Enter path to image file (e.g., E:\\sample2.jpg): ";
             cin >> inputImage;
-        
+
             string graphPath;
             cout << "Enter path to graph file (e.g., E:\\graph2.txt): ";
             cin >> graphPath;
-        
+
+            
             try {
-                GraphLoader::loadFromFile(network, graphPath);
-                cout << "Graph loaded successfully!\n";
+                int maxNode = GraphLoader::scanMaxNode(graphPath);
+                if (maxNode < 0) {
+                    throw runtime_error("Graph file contained no valid edges.");
+                }
+                nodeCount = maxNode + 1;
             } catch (const exception& e) {
-                cerr << "Error: " << e.what() << endl;
+                cerr << "Error reading graph file: " << e.what() << endl;
+                return;
+            }
+
+            network = Graph(nodeCount);
+            GraphLoader::loadFromFile(network, graphPath);
+
+            cout << "Graph loaded successfully! Detected " << nodeCount << " node(s) (0-" << nodeCount - 1 << ").\n";
+            cout << "Enter source node [0-" << nodeCount - 1 << "]: ";
+            cin >> source;
+            cout << "Enter sink node [0-" << nodeCount - 1 << "]: ";
+            cin >> sink;
+
+            if (source < 0 || source >= nodeCount || sink < 0 || sink >= nodeCount) {
+                cerr << "Error: source/sink out of range for a " << nodeCount << "-node graph.\n";
                 return;
             }
         } else {
@@ -463,14 +558,19 @@ namespace SecureImage {
             return;
         }
 
+        cout << "Enter a passphrase (used to derive the cipher key): ";
+        cin >> passphrase;
+
+        network.printAdjacencyList();
+        network.printCapacityMatrix();
+
         try {
             Mat original = ImagePreprocessor::loadOriginal(inputImage);
 
             Mat encrypted, decrypted;
-            double elapsed = 0;
             TransmissionSimulator simulator(network, source, sink);
-            int maxFlow = simulator.simulate(original, encrypted, key, elapsed);
-            simulator.decryptImage(encrypted, decrypted, key);
+            TransmissionStats stats = simulator.simulate(original, encrypted, passphrase);
+            simulator.decryptImage(encrypted, decrypted, passphrase);
 
             double mse = simulator.computeMSE(original, decrypted);
             double psnr = simulator.computePSNR(mse);
@@ -481,7 +581,14 @@ namespace SecureImage {
 
             ImagePreprocessor::saveImage(encPath, encrypted);
             ImagePreprocessor::saveImage(decPath, decrypted);
-            ReportGenerator::saveReport(reportPath, mse, psnr, maxFlow, elapsed);
+            ReportGenerator::saveReport(reportPath, mse, psnr, stats);
+
+            cout << "\n==== Transmission Summary ====\n";
+            cout << "Max flow capacity : " << stats.maxFlowCapacity << "\n";
+            cout << "Rounds to send    : " << stats.rounds << "\n";
+            cout << "Simulated transfer time: " << stats.simulatedTransferTimeMs << " ms\n";
+            cout << "Cipher time       : " << stats.cipherTimeMs << " ms\n";
+            cout << "MSE / PSNR        : " << mse << " / " << psnr << " dB\n";
 
             cout << "\nTransmission complete.\n";
             cout << "Encrypted image saved to: " << encPath << "\n";
