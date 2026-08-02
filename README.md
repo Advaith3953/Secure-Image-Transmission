@@ -1,4 +1,12 @@
-1. opencv and MSYS2 MINGW64 to be downloaded
-2. Open MSYS2 MINGW64 and navigate to the directory where "main.cpp" is present
-3. run  g++ "main.cpp" -o "build/Debug/outDebug.exe" `pkg-config --cflags --libs opencv4`
-4. Run "outDebug.exe"
+# One-time setup
+pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-opencv mingw-w64-ucrt-x86_64-pkgconf
+
+# Go to your project folder
+cd /e/Check
+mkdir -p build/Debug
+
+# Compile (use the refactored file)
+g++ -std=c++17 main_refactored.cpp -o build/Debug/outDebug.exe $(pkg-config --cflags --libs opencv4)
+
+# Run it
+./build/Debug/outDebug.exe
